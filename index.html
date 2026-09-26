@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>墨韵科技 · 云盘</title>
-<meta name="description" content="墨韵科技云端存储 —— 密码取件，安全下载">
+<meta name="description" content="墨韵科技云端存储">
 <style>
 :root{
   --bg:#f4f1e9;
@@ -226,12 +226,12 @@ body::before{
   <!-- 上传（仅所有者） -->
   <section class="card hidden" id="uploadPanel">
     <h2><span class="ico">⬆️</span>上传文件</h2>
-    <p class="sub">单文件最大 500 MB，上传后请妥善保管下载密码</p>
+    <p class="sub">单文件最大 10 GB，上传后请妥善保管下载密码</p>
 
     <div class="drop" id="drop">
       <span class="big">📁</span>
       <div class="t">点击选择文件，或将文件拖拽到此处</div>
-      <div class="h">任意格式 · 单文件 ≤ 500 MB</div>
+      <div class="h">任意格式 · 单文件 ≤ 10 GB</div>
     </div>
     <input type="file" id="fileInput" class="hidden">
 
@@ -276,6 +276,9 @@ body::before{
    ============================================================ */
 const API_BASE = 'https://myzlm.serveousercontent.com';
 
+/* 单文件上限：10 GB，与后端 DRIVE_MAX_SIZE 保持一致 */
+const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024;
+
 /* ---------------- 基础工具 ---------------- */
 const $ = s => document.querySelector(s);
 
@@ -306,7 +309,6 @@ function fmtTime(iso){
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-let toastTimer = [];
 function toast(msg, type){
   const box = $('#toast');
   const el = document.createElement('div');
@@ -445,7 +447,9 @@ drop.addEventListener('drop', e => {
 });
 
 function setPicked(f){
-  if (f.size > 500 * 1024 * 1024) return toast('文件超过 500 MB 上限', 'error');
+  if (f.size > MAX_FILE_SIZE) {
+    return toast('文件超过 10 GB 上限', 'error');
+  }
   pickedFile = f;
   $('#pickedName').textContent = f.name;
   $('#pickedSize').textContent = fmtSize(f.size);
@@ -481,13 +485,20 @@ $('#uploadBtn').onclick = () => {
   const xhr = new XMLHttpRequest();
   xhr.open('POST', API_BASE + '/api/drive/upload');
   xhr.withCredentials = true;
+  // 大文件上传不设超时，避免中途被浏览器中断
+  xhr.timeout = 0;
   if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
 
+  let lastShown = 0;
   xhr.upload.onprogress = e => {
     if (!e.lengthComputable) return;
     const pct = Math.round(e.loaded / e.total * 100);
     $('#progressBar').querySelector('i').style.width = pct + '%';
-    $('#progressTxt').textContent = `${pct}% · ${fmtSize(e.loaded)} / ${fmtSize(e.total)}`;
+    // 每变化 1% 更新一次文字，减少 DOM 重排
+    if (pct !== lastShown) {
+      lastShown = pct;
+      $('#progressTxt').textContent = `${pct}% · ${fmtSize(e.loaded)} / ${fmtSize(e.total)}`;
+    }
   };
 
   xhr.onload = () => {
@@ -510,6 +521,10 @@ $('#uploadBtn').onclick = () => {
 
   xhr.onerror = () => {
     toast('网络错误，上传失败', 'error');
+    btn.disabled = false; btn.textContent = '开始上传';
+  };
+  xhr.onabort = () => {
+    toast('上传已取消', 'error');
     btn.disabled = false; btn.textContent = '开始上传';
   };
 
