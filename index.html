@@ -226,7 +226,7 @@ body::before{
   <!-- 上传（仅所有者） -->
   <section class="card hidden" id="uploadPanel">
     <h2><span class="ico">⬆️</span>上传文件</h2>
-    <p class="sub">单文件最大 10 GB，上传后请妥善保管下载密码</p>
+    <p class="sub">单文件最大 10 GB · 自动 8MB 分片，失败自动重试，中断可断点续传</p>
 
     <div class="drop" id="drop">
       <span class="big">📁</span>
@@ -256,6 +256,7 @@ body::before{
 
     <button class="btn primary block" id="uploadBtn" style="margin-top:6px">开始上传</button>
     <button class="btn danger block hidden" id="cancelUpload" style="margin-top:8px">取消上传</button>
+    <button class="btn block hidden" id="retryUpload" style="margin-top:8px">继续上传（从断点开始）</button>
   </section>
 
   <!-- 文件列表（仅所有者） -->
@@ -464,6 +465,8 @@ function setPicked(f){
     return toast('文件超过 10 GB 上限', 'error');
   }
   pickedFile = f;
+  uploadJob = null;  // 换文件即放弃旧的上传任务
+  $('#retryUpload').classList.add('hidden');
   $('#pickedName').textContent = f.name;
   $('#pickedSize').textContent = fmtSize(f.size);
   $('#picked').classList.remove('hidden');
@@ -472,14 +475,20 @@ function setPicked(f){
 
 $('#clearPick').onclick = () => {
   pickedFile = null;
+  uploadJob = null;
   fileInput.value = '';
+  $('#retryUpload').classList.add('hidden');
   $('#picked').classList.add('hidden');
   drop.classList.remove('hidden');
 };
 
-/* ---------------- 上传 ---------------- */
-let activeXhr = null;      // 进行中的上传请求（用于取消）
-let uploading = false;     // 上传中标记（用于防止误关页面）
+/* ---------------- 分片上传 ---------------- */
+const CHUNK_SIZE = 8 * 1024 * 1024;  // 8MB/片：弱网下单片重试代价小
+const CHUNK_RETRIES = 5;             // 单片最大自动重试次数
+
+let activeXhr = null;      // 进行中的分片请求（用于取消）
+let uploading = false;     // 上传中标记（防止误关页面）
+let uploadJob = null;      // { uploadId, file, offset, pwd, note, reinited }
 
 // 上传中关闭/刷新页面给一次拦截提醒
 window.addEventListener('beforeunload', e => {
@@ -490,90 +499,193 @@ window.addEventListener('beforeunload', e => {
 });
 
 $('#cancelUpload').onclick = () => {
-  if (activeXhr) { activeXhr.abort(); }
+  if (activeXhr) activeXhr.abort();  // 触发 onabort → 清理会话
+};
+
+$('#retryUpload').onclick = () => {
+  $('#retryUpload').classList.add('hidden');
+  if (uploadJob) runUpload(uploadJob);
 };
 
 $('#refreshBtn').onclick = loadFiles;
+
+function setProgress(pct, txt){
+  $('#progressBar').querySelector('i').style.width = pct + '%';
+  $('#progressTxt').textContent = txt;
+}
+
+function resetUploadUI(){
+  uploading = false;
+  activeXhr = null;
+  $('#cancelUpload').classList.add('hidden');
+  $('#retryUpload').classList.add('hidden');
+  $('#uploadBtn').disabled = false;
+  $('#uploadBtn').textContent = '开始上传';
+}
+
+/* 单个分片：PUT raw body，服务器返回权威进度 */
+function uploadChunk(uploadId, offset, blob){
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    activeXhr = xhr;
+    xhr.open('PUT', API_BASE + '/api/drive/up/chunk'
+      + '?uploadId=' + encodeURIComponent(uploadId)
+      + '&offset=' + offset);
+    xhr.withCredentials = true;
+    xhr.timeout = 120000; // 单片超时，超时自动重试
+    if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300 && data
+          && typeof data.received === 'number') {
+        resolve(data.received);
+      } else {
+        const err = new Error((data && data.error) || ('分片上传失败（HTTP ' + xhr.status + '）'));
+        err.status = xhr.status; err.data = data;
+        reject(err);
+      }
+    };
+    xhr.onerror = () => reject(new Error('网络错误'));
+    xhr.ontimeout = () => reject(new Error('分片超时'));
+    xhr.onabort = () => {
+      const err = new Error('已取消');
+      err.cancelled = true;
+      reject(err);
+    };
+    xhr.send(blob);
+  });
+}
+
+async function runUpload(job){
+  uploading = true;
+  $('#cancelUpload').classList.remove('hidden');
+  $('#retryUpload').classList.add('hidden');
+  $('#uploadBtn').disabled = true;
+  $('#uploadBtn').textContent = '上传中…';
+  $('#progressBar').classList.remove('hidden');
+  $('#progressTxt').classList.remove('hidden');
+  setProgress(0, '准备上传…');
+
+  try {
+    // 1) 初始化 / 恢复会话
+    if (!job.uploadId) {
+      const info = await api('/api/drive/up/init', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: job.file.name,
+          size: job.file.size,
+          mime: job.file.type || '',
+          password: job.pwd,
+          note: job.note
+        })
+      });
+      job.uploadId = info.uploadId;
+      job.offset = info.received || 0;
+      if (job.offset > 0) toast('检测到历史进度，从 ' + fmtSize(job.offset) + ' 处续传', 'ok');
+    }
+
+    // 2) 逐片上传，单片自动重试
+    while (job.offset < job.file.size) {
+      const end = Math.min(job.offset + CHUNK_SIZE, job.file.size);
+      const blob = job.file.slice(job.offset, end);
+      let received = null, lastErr = null;
+
+      for (let attempt = 0; attempt <= CHUNK_RETRIES; attempt++) {
+        try {
+          received = await uploadChunk(job.uploadId, job.offset, blob);
+          break;
+        } catch (e) {
+          if (e.cancelled) throw e;
+          lastErr = e;
+          // 偏移不连续：以服务器权威进度校正后续传
+          if (e.status === 409 && e.data && typeof e.data.received === 'number') {
+            received = e.data.received;
+            break;
+          }
+          // 会话失效（服务器重启等）：自动重新初始化一次
+          if (e.status === 404) {
+            if (!job.reinited) {
+              job.reinited = true;
+              job.uploadId = null;
+              job.offset = 0;
+              toast('服务器会话已失效，自动从头重传', 'error');
+              uploading = false;
+              return runUpload(job);
+            }
+            throw e;
+          }
+          if (attempt < CHUNK_RETRIES) {
+            setProgress(Math.round(job.offset / job.file.size * 100),
+              '第 ' + (attempt + 1) + ' 次重试中…');
+            await new Promise(r => setTimeout(r, 600 * (attempt + 1)));
+          }
+        }
+      }
+      if (received == null) throw (lastErr || new Error('分片上传失败'));
+
+      job.offset = received;
+      const pct = Math.round(job.offset / job.file.size * 100);
+      setProgress(pct, pct + '% · ' + fmtSize(job.offset) + ' / '
+        + fmtSize(job.file.size) + ' · 已传 '
+        + Math.ceil(job.offset / CHUNK_SIZE) + ' 片');
+    }
+
+    // 3) 完成校验转正
+    const done = await api('/api/drive/up/complete', {
+      method: 'POST',
+      body: JSON.stringify({ uploadId: job.uploadId })
+    });
+    toast('上传成功：' + done.name + '（' + fmtSize(done.size) + '）', 'ok');
+    uploadJob = null;
+    $('#uploadPwd').value = '';
+    $('#uploadNote').value = '';
+    $('#clearPick').click();
+    $('#progressBar').classList.add('hidden');
+    $('#progressTxt').classList.add('hidden');
+    loadFiles();
+    resetUploadUI();
+  } catch (e) {
+    if (e.cancelled) {
+      // 用户主动取消：清理服务器会话与临时文件
+      if (uploadJob && uploadJob.uploadId) {
+        try {
+          await api('/api/drive/up/abort', {
+            method: 'POST',
+            body: JSON.stringify({ uploadId: uploadJob.uploadId })
+          });
+        } catch (_) {}
+      }
+      uploadJob = null;
+      toast('上传已取消', '');
+      $('#progressBar').classList.add('hidden');
+      $('#progressTxt').classList.add('hidden');
+      resetUploadUI();
+    } else {
+      // 失败但保留进度：可断点续传
+      toast('上传中断：' + e.message + '，点"继续上传"可从断点恢复', 'error');
+      $('#progressTxt').textContent = '已中断 · 已传 '
+        + fmtSize(uploadJob ? uploadJob.offset : 0);
+      resetUploadUI();
+      $('#retryUpload').classList.remove('hidden');
+    }
+  }
+}
 
 $('#uploadBtn').onclick = () => {
   if (!pickedFile) return toast('请先选择文件', 'error');
   const pwd = $('#uploadPwd').value;
   if (pwd.length < 4 || pwd.length > 128) return toast('下载密码需 4-128 位', 'error');
-
-  const btn = $('#uploadBtn');
-  btn.disabled = true; btn.textContent = '上传中…';
-  $('#cancelUpload').classList.remove('hidden');
-  $('#progressBar').classList.remove('hidden');
-  $('#progressTxt').classList.remove('hidden');
-  $('#progressBar').querySelector('i').style.width = '0%';
-  $('#progressTxt').textContent = '准备上传…';
-  uploading = true;
-
-  const fd = new FormData();
-  fd.append('file', pickedFile);
-  fd.append('password', pwd);
-  fd.append('note', ($('#uploadNote').value || '').trim());
-
-  const xhr = new XMLHttpRequest();
-  activeXhr = xhr;
-  xhr.open('POST', API_BASE + '/api/drive/upload');
-  xhr.withCredentials = true;
-  // 大文件上传不设超时，避免中途被浏览器中断
-  xhr.timeout = 0;
-  if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
-
-  let lastShown = 0;
-  xhr.upload.onprogress = e => {
-    if (!e.lengthComputable) return;
-    const pct = Math.round(e.loaded / e.total * 100);
-    $('#progressBar').querySelector('i').style.width = pct + '%';
-    // 每变化 1% 更新一次文字，减少 DOM 重排
-    if (pct !== lastShown) {
-      lastShown = pct;
-      $('#progressTxt').textContent = `${pct}% · ${fmtSize(e.loaded)} / ${fmtSize(e.total)}`;
-    }
+  uploadJob = {
+    uploadId: null,
+    file: pickedFile,
+    offset: 0,
+    pwd,
+    note: ($('#uploadNote').value || '').trim(),
+    reinited: false
   };
-
-  const finish = () => {
-    activeXhr = null;
-    uploading = false;
-    $('#cancelUpload').classList.add('hidden');
-    btn.disabled = false; btn.textContent = '开始上传';
-  };
-
-  xhr.onload = () => {
-    finish();
-    let data = null;
-    try { data = JSON.parse(xhr.responseText); } catch (_) {}
-    if (xhr.status >= 200 && xhr.status < 300 && data){
-      toast('上传成功：' + data.name, 'ok');
-      $('#uploadPwd').value = '';
-      $('#uploadNote').value = '';
-      $('#clearPick').click();
-      $('#progressBar').classList.add('hidden');
-      $('#progressTxt').classList.add('hidden');
-      loadFiles();
-    } else {
-      const detail = (data && data.error)
-        || `上传失败（HTTP ${xhr.status}）`;
-      toast(detail, 'error');
-      $('#progressTxt').textContent = '上传失败';
-    }
-  };
-
-  xhr.onerror = () => {
-    finish();
-    toast('网络错误，上传失败', 'error');
-    $('#progressTxt').textContent = '网络中断';
-  };
-  xhr.onabort = () => {
-    finish();
-    toast('上传已取消', '');
-    $('#progressBar').classList.add('hidden');
-    $('#progressTxt').classList.add('hidden');
-  };
-
-  xhr.send(fd);
+  runUpload(uploadJob);
 };
 
 /* ---------------- 文件列表 ---------------- */
