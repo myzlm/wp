@@ -232,14 +232,14 @@ body::before{
   <!-- 上传（仅所有者） -->
   <section class="card hidden" id="uploadPanel">
     <h2><span class="ico">⬆️</span>上传文件</h2>
-    <p class="sub">单文件最大 10 GB · 自动 8MB 分片，失败自动重试，中断可断点续传</p>
+    <p class="sub">仅支持 .zip / .rar 压缩包 · 最大 10 GB · 自动 8MB 分片，失败自动重试，中断可断点续传</p>
 
     <div class="drop" id="drop">
       <span class="big">📁</span>
       <div class="t">点击选择文件，或将文件拖拽到此处</div>
       <div class="h">任意格式 · 单文件 ≤ 10 GB</div>
     </div>
-    <input type="file" id="fileInput" class="hidden">
+    <input type="file" id="fileInput" class="hidden" accept=".zip,.rar">
 
     <div class="picked hidden" id="picked">
       <span style="font-size:19px">📄</span>
@@ -466,7 +466,14 @@ drop.addEventListener('drop', e => {
   if (f) setPicked(f);
 });
 
+const ALLOWED_EXT = ['.zip', '.rar'];
+
 function setPicked(f){
+  const ext = (f.name.lastIndexOf('.') >= 0
+    ? f.name.slice(f.name.lastIndexOf('.')).toLowerCase() : '');
+  if (ALLOWED_EXT.indexOf(ext) === -1) {
+    return toast('仅支持 .zip / .rar 压缩包', 'error');
+  }
   if (f.size > MAX_FILE_SIZE) {
     return toast('文件超过 10 GB 上限', 'error');
   }
@@ -821,10 +828,13 @@ function dlProgress(){
   $('#dlTxt').textContent = '下载中 ' + pct + '% · ' + fmtSize(dl.received) + ' / ' + fmtSize(dl.size);
 }
 
-// 单片请求：网络错误自动重试 5 次（递增退避）；403/404 属于致命错误直接抛出
+// 致命错误：重试也无法恢复（票据失效、文件丢失等）
+class DlFatal extends Error {}
+
+// 单片请求：网络类错误重试 3 次；403/404/400 等判定为致命直接抛 DlFatal
 async function fetchChunk(url, start, end, signal){
   let lastErr = null;
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const resp = await fetch(url, {
         headers: { Range: 'bytes=' + start + '-' + end },
@@ -832,16 +842,17 @@ async function fetchChunk(url, start, end, signal){
         signal
       });
       if (resp.status === 206) return resp;
-      if (resp.status === 403 || resp.status === 404) {
-        let d = null; try { d = await resp.json(); } catch (_) {}
-        throw new Error((d && d.error) || ('HTTP ' + resp.status));
+      let d = null; try { d = await resp.json(); } catch (_) {}
+      if (resp.status === 403 || resp.status === 404 || resp.status === 400) {
+        throw new DlFatal((d && d.error) || ('HTTP ' + resp.status));
       }
-      lastErr = new Error('HTTP ' + resp.status);
+      lastErr = new Error((d && d.error) || ('HTTP ' + resp.status));
     } catch (e) {
       if (e.name === 'AbortError') throw e;
+      if (e instanceof DlFatal) throw e;
       lastErr = e;
     }
-    await new Promise(r => setTimeout(r, 600 * attempt));
+    await new Promise(r => setTimeout(r, Math.min(1000 * attempt, 3000)));
   }
   throw (lastErr || new Error('下载失败'));
 }
@@ -856,16 +867,30 @@ async function runDownload(){
 
   const url = API_BASE + '/api/drive/download/' + encodeURIComponent(dl.id)
             + '?ticket=' + encodeURIComponent(dl.ticket);
+  let consecutiveFails = 0;
   try {
     while (dl.received < dl.size) {
       const start = dl.received;
       const end = Math.min(start + DL_CHUNK, dl.size) - 1;
-      dl.ctrl = new AbortController();
-      const resp = await fetchChunk(url, start, end, dl.ctrl.signal);
-      const buf = await resp.arrayBuffer();
-      await dl.writable.write({ type: 'write', position: start, data: buf });
-      dl.received += buf.byteLength;
-      dlProgress();
+      try {
+        dl.ctrl = new AbortController();
+        const resp = await fetchChunk(url, start, end, dl.ctrl.signal);
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength !== end - start + 1) {
+          throw new Error('分片长度异常（' + buf.byteLength + '/' + (end - start + 1) + '）');
+        }
+        await dl.writable.write({ type: 'write', position: start, data: buf });
+        dl.received += buf.byteLength;
+        consecutiveFails = 0;
+        dlProgress();
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        if (e instanceof DlFatal) throw e;
+        consecutiveFails++;
+        if (consecutiveFails > 60) throw new Error('网络持续不可用');
+        $('#dlTxt').textContent = '网络波动，5 秒后自动从断点继续（已保存 ' + fmtSize(dl.received) + '）…';
+        await new Promise(r => setTimeout(r, 5000));
+      }
     }
     await dl.writable.close();
     dl.writable = null;
@@ -878,9 +903,9 @@ async function runDownload(){
       dl = null; // 不 close，浏览器会丢弃临时写入
       hideDlUI();
     } else {
-      $('#dlTxt').textContent = '下载中断：' + e.message + '（已保存 ' + fmtSize(dl.received) + '）';
+      $('#dlTxt').textContent = '下载停止：' + e.message + '（已保存 ' + fmtSize(dl ? dl.received : 0) + '）';
       $('#dlResume').classList.remove('hidden');
-      toast('下载中断，点"继续下载"从断点恢复', 'error');
+      toast('下载停止：' + e.message, 'error');
     }
   } finally {
     if (dl) dl.busy = false;
