@@ -255,11 +255,17 @@ body::before{
     <div class="bar-txt hidden" id="progressTxt"></div>
 
     <button class="btn primary block" id="uploadBtn" style="margin-top:6px">开始上传</button>
+    <button class="btn danger block hidden" id="cancelUpload" style="margin-top:8px">取消上传</button>
   </section>
 
   <!-- 文件列表（仅所有者） -->
   <section class="card hidden" id="filesPanel">
-    <h2><span class="ico">🗂️</span>我的文件</h2>
+    <h2 style="justify-content:space-between">
+      <span style="display:inline-flex;align-items:center;gap:9px">
+        <span class="ico">🗂️</span>我的文件
+      </span>
+      <button class="btn sm" id="refreshBtn">刷新</button>
+    </h2>
     <p class="sub" id="filesSub">加载中…</p>
     <div id="fileList"></div>
   </section>
@@ -392,6 +398,13 @@ function renderPanels(){
 }
 
 /* ---------------- 登录 / 登出 ---------------- */
+$('#loginPass').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('#loginBtn').click();
+});
+$('#loginUser').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('#loginPass').focus();
+});
+
 $('#loginBtn').onclick = async () => {
   const username = $('#loginUser').value.trim();
   const password = $('#loginPass').value;
@@ -465,6 +478,23 @@ $('#clearPick').onclick = () => {
 };
 
 /* ---------------- 上传 ---------------- */
+let activeXhr = null;      // 进行中的上传请求（用于取消）
+let uploading = false;     // 上传中标记（用于防止误关页面）
+
+// 上传中关闭/刷新页面给一次拦截提醒
+window.addEventListener('beforeunload', e => {
+  if (uploading) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+$('#cancelUpload').onclick = () => {
+  if (activeXhr) { activeXhr.abort(); }
+};
+
+$('#refreshBtn').onclick = loadFiles;
+
 $('#uploadBtn').onclick = () => {
   if (!pickedFile) return toast('请先选择文件', 'error');
   const pwd = $('#uploadPwd').value;
@@ -472,17 +502,20 @@ $('#uploadBtn').onclick = () => {
 
   const btn = $('#uploadBtn');
   btn.disabled = true; btn.textContent = '上传中…';
+  $('#cancelUpload').classList.remove('hidden');
   $('#progressBar').classList.remove('hidden');
   $('#progressTxt').classList.remove('hidden');
   $('#progressBar').querySelector('i').style.width = '0%';
   $('#progressTxt').textContent = '准备上传…';
+  uploading = true;
 
   const fd = new FormData();
   fd.append('file', pickedFile);
   fd.append('password', pwd);
-  fd.append('note', $('#uploadNote').value || '');
+  fd.append('note', ($('#uploadNote').value || '').trim());
 
   const xhr = new XMLHttpRequest();
+  activeXhr = xhr;
   xhr.open('POST', API_BASE + '/api/drive/upload');
   xhr.withCredentials = true;
   // 大文件上传不设超时，避免中途被浏览器中断
@@ -501,7 +534,15 @@ $('#uploadBtn').onclick = () => {
     }
   };
 
+  const finish = () => {
+    activeXhr = null;
+    uploading = false;
+    $('#cancelUpload').classList.add('hidden');
+    btn.disabled = false; btn.textContent = '开始上传';
+  };
+
   xhr.onload = () => {
+    finish();
     let data = null;
     try { data = JSON.parse(xhr.responseText); } catch (_) {}
     if (xhr.status >= 200 && xhr.status < 300 && data){
@@ -513,19 +554,23 @@ $('#uploadBtn').onclick = () => {
       $('#progressTxt').classList.add('hidden');
       loadFiles();
     } else {
-      toast((data && data.error) || '上传失败', 'error');
+      const detail = (data && data.error)
+        || `上传失败（HTTP ${xhr.status}）`;
+      toast(detail, 'error');
       $('#progressTxt').textContent = '上传失败';
     }
-    btn.disabled = false; btn.textContent = '开始上传';
   };
 
   xhr.onerror = () => {
+    finish();
     toast('网络错误，上传失败', 'error');
-    btn.disabled = false; btn.textContent = '开始上传';
+    $('#progressTxt').textContent = '网络中断';
   };
   xhr.onabort = () => {
-    toast('上传已取消', 'error');
-    btn.disabled = false; btn.textContent = '开始上传';
+    finish();
+    toast('上传已取消', '');
+    $('#progressBar').classList.add('hidden');
+    $('#progressTxt').classList.add('hidden');
   };
 
   xhr.send(fd);
@@ -638,6 +683,9 @@ function fallbackCopy(text){
 /* ---------------- 提取下载 ---------------- */
 $('#fetchBtn').onclick = doFetch;
 $('#fetchPwd').addEventListener('keydown', e => { if (e.key === 'Enter') doFetch(); });
+$('#fetchId').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('#fetchPwd').focus();
+});
 
 async function doFetch(){
   const id = $('#fetchId').value.trim();
