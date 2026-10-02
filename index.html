@@ -221,6 +221,12 @@ body::before{
       <input class="input" id="fetchPwd" type="password" placeholder="请输入下载密码" autocomplete="off">
     </div>
     <button class="btn primary block" id="fetchBtn">提取并下载</button>
+
+    <!-- 分片下载进度 / 断点续传 -->
+    <div class="bar hidden" id="dlBar" style="margin-top:10px"><i></i></div>
+    <div class="bar-txt hidden" id="dlTxt"></div>
+    <button class="btn block hidden" id="dlResume" style="margin-top:8px">继续下载（从断点开始）</button>
+    <button class="btn danger block hidden" id="dlCancel" style="margin-top:8px">取消下载</button>
   </section>
 
   <!-- 上传（仅所有者） -->
@@ -490,9 +496,9 @@ let activeXhr = null;      // 进行中的分片请求（用于取消）
 let uploading = false;     // 上传中标记（防止误关页面）
 let uploadJob = null;      // { uploadId, file, offset, pwd, note, reinited }
 
-// 上传中关闭/刷新页面给一次拦截提醒
+// 上传/下载中关闭或刷新页面给一次拦截提醒
 window.addEventListener('beforeunload', e => {
-  if (uploading) {
+  if (uploading || (dl && dl.busy)) {
     e.preventDefault();
     e.returnValue = '';
   }
@@ -792,18 +798,114 @@ function fallbackCopy(text){
   } catch (_) { return false; }
 }
 
-/* ---------------- 提取下载 ---------------- */
+/* ---------------- 提取下载（分片 + 断点续传） ---------------- */
 $('#fetchBtn').onclick = doFetch;
 $('#fetchPwd').addEventListener('keydown', e => { if (e.key === 'Enter') doFetch(); });
 $('#fetchId').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('#fetchPwd').focus();
 });
 
+const DL_CHUNK = 4 * 1024 * 1024; // 每片 4MB：隧道抖动最多重试 4MB，不用从头来
+let dl = null; // { id, name, size, ticket, received, handle, writable, busy, ctrl }
+
+function hideDlUI(){
+  $('#dlBar').classList.add('hidden');
+  $('#dlTxt').classList.add('hidden');
+  $('#dlResume').classList.add('hidden');
+  $('#dlCancel').classList.add('hidden');
+}
+
+function dlProgress(){
+  const pct = dl.size ? Math.floor(dl.received / dl.size * 100) : 100;
+  $('#dlBar').querySelector('i').style.width = pct + '%';
+  $('#dlTxt').textContent = '下载中 ' + pct + '% · ' + fmtSize(dl.received) + ' / ' + fmtSize(dl.size);
+}
+
+// 单片请求：网络错误自动重试 5 次（递增退避）；403/404 属于致命错误直接抛出
+async function fetchChunk(url, start, end, signal){
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        headers: { Range: 'bytes=' + start + '-' + end },
+        credentials: 'include',
+        signal
+      });
+      if (resp.status === 206) return resp;
+      if (resp.status === 403 || resp.status === 404) {
+        let d = null; try { d = await resp.json(); } catch (_) {}
+        throw new Error((d && d.error) || ('HTTP ' + resp.status));
+      }
+      lastErr = new Error('HTTP ' + resp.status);
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      lastErr = e;
+    }
+    await new Promise(r => setTimeout(r, 600 * attempt));
+  }
+  throw (lastErr || new Error('下载失败'));
+}
+
+async function runDownload(){
+  dl.busy = true;
+  $('#dlResume').classList.add('hidden');
+  $('#dlCancel').classList.remove('hidden');
+  $('#dlBar').classList.remove('hidden');
+  $('#dlTxt').classList.remove('hidden');
+  dlProgress();
+
+  const url = API_BASE + '/api/drive/download/' + encodeURIComponent(dl.id)
+            + '?ticket=' + encodeURIComponent(dl.ticket);
+  try {
+    while (dl.received < dl.size) {
+      const start = dl.received;
+      const end = Math.min(start + DL_CHUNK, dl.size) - 1;
+      dl.ctrl = new AbortController();
+      const resp = await fetchChunk(url, start, end, dl.ctrl.signal);
+      const buf = await resp.arrayBuffer();
+      await dl.writable.write({ type: 'write', position: start, data: buf });
+      dl.received += buf.byteLength;
+      dlProgress();
+    }
+    await dl.writable.close();
+    dl.writable = null;
+    toast('下载完成：' + dl.name, 'ok');
+    dl = null;
+    hideDlUI();
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      toast('下载已取消', '');
+      dl = null; // 不 close，浏览器会丢弃临时写入
+      hideDlUI();
+    } else {
+      $('#dlTxt').textContent = '下载中断：' + e.message + '（已保存 ' + fmtSize(dl.received) + '）';
+      $('#dlResume').classList.remove('hidden');
+      toast('下载中断，点"继续下载"从断点恢复', 'error');
+    }
+  } finally {
+    if (dl) dl.busy = false;
+    $('#dlCancel').classList.add('hidden');
+  }
+}
+
+// 兜底：浏览器不支持 File System Access API 时，走原生下载（后端 Range/长票据仍支持浏览器自身续传）
+function fallbackDirect(url, name){
+  const a = document.createElement('a');
+  a.href = url;
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 1000);
+  toast('已开始下载：' + name, 'ok');
+}
+
 async function doFetch(){
   const id = $('#fetchId').value.trim();
   const pwd = $('#fetchPwd').value;
   if (!id) return toast('请输入文件 ID', 'error');
   if (!pwd) return toast('请输入下载密码', 'error');
+  if (dl && dl.busy) return toast('已有下载进行中', 'error');
 
   const btn = $('#fetchBtn');
   btn.disabled = true; btn.textContent = '验证中…';
@@ -816,22 +918,46 @@ async function doFetch(){
     const url = API_BASE + '/api/drive/download/' + encodeURIComponent(id)
               + '?ticket=' + encodeURIComponent(data.ticket);
 
-    const a = document.createElement('a');
-    a.href = url;
-    a.rel = 'noopener';
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => a.remove(), 1000);
-
-    $('#fetchPwd').value = '';
-    toast(`开始下载：${data.name}（${fmtSize(data.size)}）`, 'ok');
+    if (window.showSaveFilePicker) {
+      // 分片下载：逐片拉取写盘，失败可从断点恢复
+      const handle = await window.showSaveFilePicker({ suggestedName: data.name });
+      const writable = await handle.createWritable();
+      dl = {
+        id, name: data.name, size: data.size, ticket: data.ticket,
+        received: 0, handle, writable, busy: false, ctrl: null
+      };
+      $('#fetchPwd').value = '';
+      toast('开始下载：' + data.name + '（' + fmtSize(data.size) + '）', 'ok');
+      runDownload();
+    } else {
+      $('#fetchPwd').value = '';
+      fallbackDirect(url, data.name);
+    }
   } catch (e) {
-    toast(e.message, 'error');
+    if (e && e.name === 'AbortError') {
+      toast('已取消选择保存位置', '');
+    } else {
+      toast(e.message, 'error');
+    }
   } finally {
     btn.disabled = false; btn.textContent = '提取并下载';
   }
 }
+
+// 断点续传：复用票据与已选文件句柄，从 received 处接着拉
+$('#dlResume').onclick = async () => {
+  if (!dl || dl.busy) return;
+  try {
+    if (!dl.writable) dl.writable = await dl.handle.createWritable();
+  } catch (_) {
+    return toast('无法继续写入已选文件，请重新提取', 'error');
+  }
+  runDownload();
+};
+
+$('#dlCancel').onclick = () => {
+  if (dl && dl.ctrl) dl.ctrl.abort();
+};
 
 /* ---------------- 启动 ---------------- */
 init();
