@@ -813,7 +813,8 @@ $('#fetchId').addEventListener('keydown', e => {
 });
 
 const DL_CHUNK = 4 * 1024 * 1024; // 每片 4MB：隧道抖动最多重试 4MB，不用从头来
-let dl = null; // { id, name, size, ticket, received, handle, writable, busy, ctrl }
+const DL_PARALLEL = 3;            // 并行分片连接数：SSH 隧道对单条 TCP 吞吐有限，多路并行可显著提速
+let dl = null; // { id, name, size, ticket, received, handle, writable, busy, ctrls }
 
 function hideDlUI(){
   $('#dlBar').classList.add('hidden');
@@ -867,37 +868,67 @@ async function runDownload(){
 
   const url = API_BASE + '/api/drive/download/' + encodeURIComponent(dl.id)
             + '?ticket=' + encodeURIComponent(dl.ticket);
-  let consecutiveFails = 0;
-  try {
-    while (dl.received < dl.size) {
-      const start = dl.received;
+
+  let nextOffset = dl.received;   // 下一个待抓取分片的偏移（ workers 之间同步领取，无竞争 ）
+  let contiguous = dl.received;   // 已按序写盘的偏移（断点续传的真实进度）
+  let stopped = false;            // 任一环节失败后叫停其他线程
+  const ready = new Map();        // 乱序到达的分片缓存：offset -> ArrayBuffer
+  dl.ctrls = new Set();           // 所有在途请求，用于取消
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // 写盘线程：只按顺序消费连续分片，保证文件字节序正确
+  async function writerLoop(){
+    while (contiguous < dl.size) {
+      if (stopped) throw new Error('已停止');
+      const buf = ready.get(contiguous);
+      if (!buf) { await sleep(25); continue; }
+      ready.delete(contiguous);
+      await dl.writable.write({ type: 'write', position: contiguous, data: buf });
+      contiguous += buf.byteLength;
+      dl.received = contiguous;
+      dlProgress();
+    }
+  }
+
+  // 抓取线程（DL_PARALLEL 路）：各领各的分片，乱序到达交给写盘线程排队
+  async function worker(){
+    let fails = 0;
+    while (nextOffset < dl.size) {
+      const start = nextOffset;
+      nextOffset = Math.min(start + DL_CHUNK, dl.size);
       const end = Math.min(start + DL_CHUNK, dl.size) - 1;
+      const ctrl = new AbortController();
+      dl.ctrls.add(ctrl);
       try {
-        dl.ctrl = new AbortController();
-        const resp = await fetchChunk(url, start, end, dl.ctrl.signal);
+        const resp = await fetchChunk(url, start, end, ctrl.signal);
         const buf = await resp.arrayBuffer();
-        if (buf.byteLength !== end - start + 1) {
-          throw new Error('分片长度异常（' + buf.byteLength + '/' + (end - start + 1) + '）');
-        }
-        await dl.writable.write({ type: 'write', position: start, data: buf });
-        dl.received += buf.byteLength;
-        consecutiveFails = 0;
-        dlProgress();
+        if (buf.byteLength !== end - start + 1) throw new Error('分片长度异常');
+        ready.set(start, buf);
+        fails = 0;
       } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        if (e instanceof DlFatal) throw e;
-        consecutiveFails++;
-        if (consecutiveFails > 60) throw new Error('网络持续不可用');
-        $('#dlTxt').textContent = '网络波动，5 秒后自动从断点继续（已保存 ' + fmtSize(dl.received) + '）…';
-        await new Promise(r => setTimeout(r, 5000));
+        nextOffset = start;  // 分片归还，稍后重领
+        if (e.name === 'AbortError' || e instanceof DlFatal) throw e;
+        if (++fails > 60) throw new Error('网络持续不可用');
+        await sleep(5000);   // 网络波动：5 秒后自动重试，不中断整体
+      } finally {
+        dl.ctrls.delete(ctrl);
       }
     }
+  }
+
+  try {
+    const runners = [writerLoop()];
+    const nWorkers = Math.min(DL_PARALLEL, Math.ceil((dl.size - dl.received) / DL_CHUNK));
+    for (let i = 0; i < nWorkers; i++) runners.push(worker());
+    await Promise.all(runners);
     await dl.writable.close();
     dl.writable = null;
     toast('下载完成：' + dl.name, 'ok');
     dl = null;
     hideDlUI();
   } catch (e) {
+    stopped = true;
+    for (const c of dl.ctrls) { try { c.abort(); } catch (_) {} }
     if (e.name === 'AbortError') {
       toast('下载已取消', '');
       dl = null; // 不 close，浏览器会丢弃临时写入
@@ -908,7 +939,9 @@ async function runDownload(){
       toast('下载停止：' + e.message, 'error');
     }
   } finally {
-    if (dl) dl.busy = false;
+    stopped = true;
+    for (const c of (dl && dl.ctrls || [])) { try { c.abort(); } catch (_) {} }
+    if (dl) { dl.ctrls.clear(); dl.busy = false; }
     $('#dlCancel').classList.add('hidden');
   }
 }
@@ -949,7 +982,7 @@ async function doFetch(){
       const writable = await handle.createWritable();
       dl = {
         id, name: data.name, size: data.size, ticket: data.ticket,
-        received: 0, handle, writable, busy: false, ctrl: null
+        received: 0, handle, writable, busy: false, ctrls: null
       };
       $('#fetchPwd').value = '';
       toast('开始下载：' + data.name + '（' + fmtSize(data.size) + '）', 'ok');
@@ -981,7 +1014,7 @@ $('#dlResume').onclick = async () => {
 };
 
 $('#dlCancel').onclick = () => {
-  if (dl && dl.ctrl) dl.ctrl.abort();
+  if (dl && dl.ctrls) for (const c of dl.ctrls) { try { c.abort(); } catch (_) {} }
 };
 
 /* ---------------- 启动 ---------------- */
