@@ -812,7 +812,7 @@ $('#fetchId').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('#fetchPwd').focus();
 });
 
-const DL_CHUNK = 4 * 1024 * 1024; // 每片 4MB：隧道抖动最多重试 4MB，不用从头来
+const DL_CHUNK = 1024 * 1024;     // 每片 1MB：不稳隧道下单片约 1 秒，重试代价小、恢复快
 const DL_PARALLEL = 3;            // 并行分片连接数：SSH 隧道对单条 TCP 吞吐有限，多路并行可显著提速
 let dl = null; // { id, name, size, ticket, received, handle, writable, busy, ctrls }
 
@@ -843,6 +843,13 @@ async function fetchChunk(url, start, end, signal){
         signal
       });
       if (resp.status === 206) return resp;
+      // 非 206：必须先掐断响应体，否则连接被挂住，几次之后连接池耗尽、后续请求全部卡死
+      try { if (resp.body) resp.body.cancel(); } catch (_) {}
+      if (resp.status === 200) {
+        // 服务器没按 Range 返回：多半是中间层剥了 Range 头，或 If-Range 回退成了全量。
+        // 绝不能把全量响应当分片读（会把整个文件读进内存），直接判致命并说明原因
+        throw new DlFatal('服务器未按分片返回（HTTP 200）：请检查隧道/代理是否剥离了 Range 请求头');
+      }
       let d = null; try { d = await resp.json(); } catch (_) {}
       if (resp.status === 403 || resp.status === 404 || resp.status === 400) {
         throw new DlFatal((d && d.error) || ('HTTP ' + resp.status));
@@ -922,8 +929,15 @@ async function runDownload(){
     for (let i = 0; i < nWorkers; i++) runners.push(worker());
     await Promise.all(runners);
     await dl.writable.close();
+    // 落盘校验：磁盘上的文件必须和源文件一样大，否则不谎报成功
+    const saved = await dl.handle.getFile().catch(() => null);
     dl.writable = null;
-    toast('下载完成：' + dl.name, 'ok');
+    if (saved && saved.size === dl.size) {
+      toast('下载完成：' + dl.name, 'ok');
+    } else {
+      const got = saved ? fmtSize(saved.size) : '未知';
+      toast('下载完成但文件校验异常（磁盘 ' + got + ' / 应为 ' + fmtSize(dl.size) + '），建议删除后重新下载', 'error');
+    }
     dl = null;
     hideDlUI();
   } catch (e) {
@@ -978,7 +992,17 @@ async function doFetch(){
 
     if (window.showSaveFilePicker) {
       // 分片下载：逐片拉取写盘，失败可从断点恢复
-      const handle = await window.showSaveFilePicker({ suggestedName: data.name });
+      let handle = null;
+      try {
+        handle = await window.showSaveFilePicker({ suggestedName: data.name });
+      } catch (pe) {
+        if (pe && pe.name === 'AbortError') throw pe; // 用户主动取消
+        // SecurityError/NotAllowedError：验证密码耗时太久、用户手势过期 → 退回原生下载
+        $('#fetchPwd').value = '';
+        toast('浏览器不允许此时弹窗，已改用浏览器直接下载', '');
+        fallbackDirect(url, data.name);
+        return;
+      }
       const writable = await handle.createWritable();
       dl = {
         id, name: data.name, size: data.size, ticket: data.ticket,
@@ -1006,7 +1030,9 @@ async function doFetch(){
 $('#dlResume').onclick = async () => {
   if (!dl || dl.busy) return;
   try {
-    if (!dl.writable) dl.writable = await dl.handle.createWritable();
+    // keepExistingData: 必须保留已写入内容；否则文件被清零后从中间偏移写入，
+    // 文件大小对了但前半截全是 0（压缩包打不开 = "下载没成功"）
+    if (!dl.writable) dl.writable = await dl.handle.createWritable({ keepExistingData: true });
   } catch (_) {
     return toast('无法继续写入已选文件，请重新提取', 'error');
   }
