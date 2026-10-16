@@ -812,8 +812,11 @@ $('#fetchId').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('#fetchPwd').focus();
 });
 
-const DL_CHUNK = 1024 * 1024;     // 每片 1MB：不稳隧道下单片约 1 秒，重试代价小、恢复快
-const DL_PARALLEL = 3;            // 并行分片连接数：SSH 隧道对单条 TCP 吞吐有限，多路并行可显著提速
+const DL_CHUNK = 128 * 1024;      // 每片 128KB：实测 serveo 隧道单连接响应体传到约 144KB(147456B) 必被掐断，
+                                  // 分片必须小于该阈值才能完整通过；片变小请求数变多，靠并行弥补速度
+const DL_PARALLEL = 3;            // 并行分片连接数：隧道单连接吞吐极低，多路并行弥补总速度
+const DL_BODY_TIMEOUT = 45000;    // 单片响应体读取超时：被隧道掐死的连接可能不报错也不结束，
+                                  // 若不主动掐断重试，写盘线程会永远等第一片，进度卡 0%
 let dl = null; // { id, name, size, ticket, received, handle, writable, busy, ctrls }
 
 function hideDlUI(){
@@ -908,7 +911,23 @@ async function runDownload(){
       dl.ctrls.add(ctrl);
       try {
         const resp = await fetchChunk(url, start, end, ctrl.signal);
-        const buf = await resp.arrayBuffer();
+        const bodyP = resp.arrayBuffer();
+        bodyP.catch(() => {});  // 竞态败者的拒绝不落成 unhandled rejection
+        let buf;
+        const timer = setTimeout(() => {
+          try { ctrl.abort(); } catch (_) {}  // 看门狗到点：掐断挂死的连接
+        }, DL_BODY_TIMEOUT);
+        try {
+          buf = await Promise.race([
+            bodyP,
+            new Promise((_, rej) => setTimeout(() => rej(new Error('BODY_TIMEOUT')), DL_BODY_TIMEOUT))
+          ]);
+        } catch (e) {
+          if (e.message === 'BODY_TIMEOUT') throw new Error('分片响应超时');  // 转为可重试错误
+          throw e;
+        } finally {
+          clearTimeout(timer);
+        }
         if (buf.byteLength !== end - start + 1) throw new Error('分片长度异常');
         ready.set(start, buf);
         fails = 0;
