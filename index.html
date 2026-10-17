@@ -1029,8 +1029,11 @@ $('#fetchId').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('#fetchPwd').focus();
 });
 
-const DL_CHUNK = 128 * 1024;      // 每片 128KB：实测 serveo 隧道单连接响应体传到约 144KB(147456B) 必被掐断，
-                                  // 分片必须小于该阈值才能完整通过；片变小请求数变多，靠并行弥补速度
+const DL_CHUNK_MAX = 128 * 1024;  // 起始/最大分片：实测 serveo 隧道单连接响应体传到约 144KB(147456B) 必被掐断
+const DL_CHUNK_MIN = 16 * 1024;   // 自适应下限：隧道进一步劣化时自动降档保命
+const DL_GROW_AFTER = 12;         // 连续成功 N 片后尝试升档（隧道恢复时自动提速）
+let DL_CHUNK = DL_CHUNK_MAX;      // 当前自适应分片大小（页面会话级）
+let FETCH_SEQ = 0;                // 每次尝试使用唯一 URL：避免浏览器复用被掐断的连接池连接 / 中间缓存
 const DL_PARALLEL = 3;            // 并行分片连接数：隧道单连接吞吐极低，多路并行弥补总速度
 const DL_BODY_TIMEOUT = 45000;    // 单片响应体读取超时：被隧道掐死的连接可能不报错也不结束，
                                   // 若不主动掐断重试，写盘线程会永远等第一片，进度卡 0%
@@ -1046,7 +1049,7 @@ function hideDlUI(){
 function dlProgress(){
   const pct = dl.size ? Math.floor(dl.received / dl.size * 100) : 100;
   $('#dlBar').querySelector('i').style.width = pct + '%';
-  $('#dlTxt').textContent = '下载中 ' + pct + '% · ' + fmtSize(dl.received) + ' / ' + fmtSize(dl.size);
+  $('#dlTxt').textContent = '下载中 ' + pct + '% · ' + fmtSize(dl.received) + ' / ' + fmtSize(dl.size) + ' · 片' + Math.round(DL_CHUNK / 1024) + 'KB';
 }
 
 // 致命错误：重试也无法恢复（票据失效、文件丢失等）
@@ -1057,7 +1060,8 @@ async function fetchChunk(url, start, end, signal){
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const resp = await fetch(url, {
+      // 每次尝试用唯一 URL：防止复用可能已被掐断的 keep-alive 连接，也绕开任何忽略 Range 的中间缓存
+      const resp = await fetch(url + '&_a=' + (++FETCH_SEQ), {
         headers: { Range: 'bytes=' + start + '-' + end },
         credentials: 'include',
         signal
@@ -1119,11 +1123,11 @@ async function runDownload(){
 
   // 抓取线程（DL_PARALLEL 路）：各领各的分片，乱序到达交给写盘线程排队
   async function worker(){
-    let fails = 0;
+    let fails = 0, streak = 0;
     while (nextOffset < dl.size) {
       const start = nextOffset;
-      nextOffset = Math.min(start + DL_CHUNK, dl.size);
       const end = Math.min(start + DL_CHUNK, dl.size) - 1;
+      nextOffset = end + 1;
       const ctrl = new AbortController();
       dl.ctrls.add(ctrl);
       try {
@@ -1145,13 +1149,22 @@ async function runDownload(){
         } finally {
           clearTimeout(timer);
         }
-        if (buf.byteLength !== end - start + 1) throw new Error('分片长度异常');
+        if (buf.byteLength !== end - start + 1) {
+          // 响应体被掐断（隧道劣化特征）：立刻降档，下次用更小的片试
+          DL_CHUNK = Math.max(DL_CHUNK_MIN, Math.floor(DL_CHUNK / 2));
+          throw new Error('分片不完整（收到 ' + buf.byteLength + '/' + (end - start + 1) + ' 字节）');
+        }
         ready.set(start, buf);
+        if (++streak >= DL_GROW_AFTER && DL_CHUNK < DL_CHUNK_MAX) {
+          DL_CHUNK = Math.min(DL_CHUNK_MAX, DL_CHUNK * 2);  // 隧道稳定：逐步升档提速
+          streak = 0;
+        }
         fails = 0;
       } catch (e) {
         nextOffset = start;  // 分片归还，稍后重领
         if (e.name === 'AbortError' || e instanceof DlFatal) throw e;
         if (++fails > 60) throw new Error('网络持续不可用');
+        DL_CHUNK = Math.max(DL_CHUNK_MIN, Math.floor(DL_CHUNK / 2));  // 失败即降档：128K→64K→32K→16K
         await sleep(5000);   // 网络波动：5 秒后自动重试，不中断整体
       } finally {
         dl.ctrls.delete(ctrl);
@@ -1187,6 +1200,7 @@ async function runDownload(){
       $('#dlTxt').textContent = '下载停止：' + e.message + '（已保存 ' + fmtSize(dl ? dl.received : 0) + '）';
       $('#dlResume').classList.remove('hidden');
       toast('下载停止：' + e.message, 'error');
+      toast('反复失败？请 Ctrl+F5 强制刷新页面，且必须用 https://myzlm.github.io/wp/ 打开（本地 file:// 打开必然失败）', '');
     }
   } finally {
     stopped = true;
@@ -1280,6 +1294,14 @@ $('#dlCancel').onclick = () => {
 };
 
 /* ---------------- 启动 ---------------- */
+// 本地 file:// 打开的页面会被浏览器 CORS 拦截所有响应（服务端照常发送但页面读不到），
+// 表现为上传/下载无限重试失败——必须第一时间告知用户，避免"后端正常但客户端永远失败"
+if (location.protocol === 'file:') {
+  const b = document.createElement('div');
+  b.style.cssText = 'position:sticky;top:0;z-index:999;background:var(--seal,#a83a2c);color:#fff;padding:10px 16px;font-size:13px;line-height:1.5;text-align:center';
+  b.innerHTML = '⚠️ 你正在用本地文件（file://）打开本页面，浏览器会拦截所有跨域请求，<b>上传和下载必然失败</b>。<br>请访问正式地址：<b>https://myzlm.github.io/wp/</b>';
+  document.body.prepend(b);
+}
 init();
 </script>
 </body>
