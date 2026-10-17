@@ -19,6 +19,53 @@
   --ok:#2f7a53;
   --r:14px;
   --shadow:0 1px 2px rgba(30,25,15,.04), 0 12px 32px rgba(30,25,15,.07);
+  --field-bg:#ffffff;
+  --placeholder:#b9b5ac;
+  --btn-hover-bg:#faf8f3;
+  --btn-hover-border:#d9d3c5;
+  --danger-border:#eddcd8;
+  --danger-bg:#fdf4f2;
+  --danger-border-hover:#e3c7c1;
+  --drop-border:#d8d2c4;
+  --drop-bg:#fdfbf6;
+  --drop-hover-bg:#f7f9fd;
+  --picked-bg:#f3f7fd;
+  --picked-border:#d8e3f3;
+  --bar-bg:#eae5da;
+  --fi-bg:#f2efe7;
+  --tag-bg:#eef3fb;
+  --ok-border:#cbe6d6; --ok-bg:#f4fbf7; --ok-ink:#1f6b47;
+  --err-border:#efd3cd; --err-bg:#fdf6f4; --err-ink:#9c3627;
+}
+html[data-theme="dark"]{
+  --bg:#15130f;
+  --panel:#1e1b16;
+  --ink:#ece7dc;
+  --ink-2:#b5afa2;
+  --ink-3:#827c70;
+  --line:#302b23;
+  --accent:#5b82b8;
+  --accent-2:#7399c9;
+  --seal:#d0604f;
+  --ok:#5aab7f;
+  --shadow:0 1px 2px rgba(0,0,0,.35), 0 12px 32px rgba(0,0,0,.45);
+  --field-bg:#262219;
+  --placeholder:#5d584d;
+  --btn-hover-bg:#262219;
+  --btn-hover-border:#3a352b;
+  --danger-border:#4a2e28;
+  --danger-bg:#2b1e1a;
+  --danger-border-hover:#5c3a32;
+  --drop-border:#3a352b;
+  --drop-bg:#1a1712;
+  --drop-hover-bg:#1e222b;
+  --picked-bg:#1e2229;
+  --picked-border:#2e3a4d;
+  --bar-bg:#2a251d;
+  --fi-bg:#262219;
+  --tag-bg:#232c3a;
+  --ok-border:#2c4a3a; --ok-bg:#18251e; --ok-ink:#7cc9a2;
+  --err-border:#54322b; --err-bg:#2a1c18; --err-ink:#e08a7a;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;padding:0}
@@ -77,19 +124,19 @@ body::before{
 .field label{display:block;font-size:13px;color:var(--ink-2);margin-bottom:6px;font-weight:500}
 .input{
   width:100%;padding:11px 14px;font-size:15px;font-family:inherit;
-  background:#fff;border:1px solid var(--line);border-radius:10px;
+  background:var(--field-bg);border:1px solid var(--line);border-radius:10px;
   color:var(--ink);outline:none;transition:border-color .18s, box-shadow .18s;
 }
 .input:focus{border-color:var(--accent-2);box-shadow:0 0 0 3px rgba(61,103,163,.12)}
-.input::placeholder{color:#b9b5ac}
+.input::placeholder{color:var(--placeholder)}
 
 .btn{
   display:inline-flex;align-items:center;justify-content:center;gap:7px;
   padding:11px 22px;font-size:14px;font-family:inherit;font-weight:600;
-  border-radius:10px;border:1px solid var(--line);background:#fff;color:var(--ink-2);
+  border-radius:10px;border:1px solid var(--line);background:var(--field-bg);color:var(--ink-2);
   cursor:pointer;transition:all .18s;letter-spacing:.5px;white-space:nowrap;
 }
-.btn:hover{background:#faf8f3;border-color:#d9d3c5}
+.btn:hover{background:var(--btn-hover-bg);border-color:var(--btn-hover-border)}
 .btn:active{transform:translateY(1px)}
 .btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
 .btn.primary{
@@ -98,28 +145,28 @@ body::before{
   box-shadow:0 4px 14px rgba(43,76,126,.25);
 }
 .btn.primary:hover{filter:brightness(1.07)}
-.btn.danger{color:var(--seal);border-color:#eddcd8}
-.btn.danger:hover{background:#fdf4f2;border-color:#e3c7c1}
+.btn.danger{color:var(--seal);border-color:var(--danger-border)}
+.btn.danger:hover{background:var(--danger-bg);border-color:var(--danger-border-hover)}
 .btn.sm{padding:6px 13px;font-size:12.5px;border-radius:8px;font-weight:500}
 .btn.block{width:100%}
 
 /* ---------- 上传区 ---------- */
 .drop{
-  border:1.5px dashed #d8d2c4;border-radius:12px;padding:30px 20px;
-  text-align:center;cursor:pointer;transition:all .2s;background:#fdfbf6;
+  border:1.5px dashed var(--drop-border);border-radius:12px;padding:30px 20px;
+  text-align:center;cursor:pointer;transition:all .2s;background:var(--drop-bg);
 }
-.drop:hover,.drop.over{border-color:var(--accent-2);background:#f7f9fd}
+.drop:hover,.drop.over{border-color:var(--accent-2);background:var(--drop-hover-bg)}
 .drop .big{font-size:30px;display:block;margin-bottom:8px;opacity:.75}
 .drop .t{font-size:14px;color:var(--ink-2);font-weight:500}
 .drop .h{font-size:12px;color:var(--ink-3);margin-top:5px}
 .picked{
   display:flex;align-items:center;gap:11px;padding:12px 14px;
-  background:#f3f7fd;border:1px solid #d8e3f3;border-radius:11px;margin-bottom:14px;
+  background:var(--picked-bg);border:1px solid var(--picked-border);border-radius:11px;margin-bottom:14px;
 }
 .picked .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}
 .picked .sz{font-size:12px;color:var(--ink-3);flex:0 0 auto}
 
-.bar{height:6px;background:#eae5da;border-radius:99px;overflow:hidden;margin:14px 0 6px}
+.bar{height:6px;background:var(--bar-bg);border-radius:99px;overflow:hidden;margin:14px 0 6px}
 .bar > i{display:block;height:100%;width:0;border-radius:99px;
   background:linear-gradient(90deg,var(--accent-2),var(--accent));transition:width .25s}
 .bar-txt{font-size:12px;color:var(--ink-3);text-align:center}
@@ -132,7 +179,7 @@ body::before{
 .file:last-child{border-bottom:none}
 .file .fi{
   width:40px;height:40px;flex:0 0 40px;border-radius:10px;
-  background:#f2efe7;display:grid;place-items:center;font-size:18px;
+  background:var(--fi-bg);display:grid;place-items:center;font-size:18px;
 }
 .file .fm{flex:1;min-width:0}
 .file .fn{
@@ -141,7 +188,7 @@ body::before{
 }
 .file .meta{font-size:12px;color:var(--ink-3);display:flex;flex-wrap:wrap;gap:4px 10px}
 .file .meta .tag{
-  background:#eef3fb;color:var(--accent);border-radius:5px;padding:0 6px;
+  background:var(--tag-bg);color:var(--accent);border-radius:5px;padding:0 6px;
   font-size:11px;line-height:17px;
 }
 .file .acts{display:flex;gap:6px;flex:0 0 auto;flex-wrap:wrap;justify-content:flex-end}
@@ -157,16 +204,31 @@ body::before{
 }
 .toast{
   padding:11px 20px;border-radius:11px;font-size:13.5px;font-weight:500;
-  background:#fff;border:1px solid var(--line);color:var(--ink);
+  background:var(--panel);border:1px solid var(--line);color:var(--ink);
   box-shadow:0 10px 30px rgba(30,25,15,.14);
   opacity:0;transform:translateY(12px);transition:all .28s;
   max-width:100%;
 }
 .toast.show{opacity:1;transform:translateY(0)}
-.toast.ok{border-color:#cbe6d6;background:#f4fbf7;color:#1f6b47}
-.toast.error{border-color:#efd3cd;background:#fdf6f4;color:#9c3627}
+.toast.ok{border-color:var(--ok-border);background:var(--ok-bg);color:var(--ok-ink)}
+.toast.error{border-color:var(--err-border);background:var(--err-bg);color:var(--err-ink)}
 
 .hidden{display:none !important}
+
+/* ---------- 深色模式 ---------- */
+html[data-theme="dark"] body::before{
+  background:
+    radial-gradient(circle at 15% 8%, rgba(115,153,201,.075), transparent 45%),
+    radial-gradient(circle at 85% 85%, rgba(208,96,79,.055), transparent 45%);
+}
+body{transition:background-color .25s, color .25s}
+.theme-btn{
+  width:36px;height:36px;flex:0 0 36px;border-radius:50%;
+  display:grid;place-items:center;line-height:1;font-size:15px;
+  background:var(--panel);border:1px solid var(--line);cursor:pointer;
+  box-shadow:0 1px 2px rgba(30,25,15,.03);transition:transform .18s, border-color .18s;
+}
+.theme-btn:hover{border-color:var(--btn-hover-border);transform:rotate(14deg)}
 
 @media (max-width:620px){
   .card{padding:19px 16px}
@@ -177,6 +239,18 @@ body::before{
   .brand p{display:none}
 }
 </style>
+<script>
+/* 首帧前应用主题，避免闪白：优先用户记忆，其次跟随系统 */
+(function(){
+  try{
+    var t = localStorage.getItem('moyun_theme');
+    if (t !== 'dark' && t !== 'light') {
+      t = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.dataset.theme = t;
+  }catch(e){ document.documentElement.dataset.theme = 'light'; }
+})();
+</script>
 </head>
 <body>
 
@@ -188,7 +262,10 @@ body::before{
       <p>云端存储 · 密码取件</p>
     </div>
   </div>
-  <div class="user-area" id="userArea"></div>
+  <div class="user-area">
+    <button class="theme-btn" id="themeBtn" title="切换深色 / 浅色模式">🌙</button>
+    <span id="userArea"></span>
+  </div>
 </header>
 
 <div class="wrap">
@@ -311,6 +388,19 @@ let csrfToken = '';
 let me = null;
 let pickedFile = null;
 let myFiles = [];
+
+/* ---------------- 主题切换 ---------------- */
+(function(){
+  const btn = $('#themeBtn');
+  const icon = () => document.documentElement.dataset.theme === 'dark' ? '☀️' : '🌙';
+  btn.textContent = icon();
+  btn.onclick = () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('moyun_theme', next); } catch (_) {}
+    btn.textContent = icon();
+  };
+})();
 
 function esc(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
