@@ -265,6 +265,18 @@ body::before{
     <button class="btn block hidden" id="retryUpload" style="margin-top:8px">继续上传（从断点开始）</button>
   </section>
 
+  <!-- 本地导入（仅所有者）：登记手动放进服务器网盘目录的文件 -->
+  <section class="card hidden" id="importPanel">
+    <h2 style="justify-content:space-between">
+      <span style="display:inline-flex;align-items:center;gap:9px">
+        <span class="ico">📥</span>本地导入
+      </span>
+      <button class="btn sm" id="importScanBtn">扫描网盘目录</button>
+    </h2>
+    <p class="sub">手动拷到服务器网盘目录（drive 文件夹）里的文件不会自动出现在列表里，扫描后在这里登记即可纳入网盘管理；同时会检查"磁盘缺文件"的失效登记</p>
+    <div id="importResult"></div>
+  </section>
+
   <!-- 文件列表（仅所有者） -->
   <section class="card hidden" id="filesPanel">
     <h2 style="justify-content:space-between">
@@ -402,6 +414,8 @@ function renderPanels(){
   $('#loginPanel').classList.toggle('hidden', !!me);
   $('#uploadPanel').classList.toggle('hidden', !isOwner);
   $('#filesPanel').classList.toggle('hidden', !isOwner);
+  $('#importPanel').classList.toggle('hidden', !isOwner);
+  if (isOwner) scanImport();
 }
 
 /* ---------------- 登录 / 登出 ---------------- */
@@ -700,6 +714,119 @@ $('#uploadBtn').onclick = () => {
   };
   runUpload(uploadJob);
 };
+
+/* ---------------- 本地导入 ---------------- */
+async function scanImport(){
+  const box = $('#importResult');
+  box.innerHTML = '<p class="sub">扫描中…</p>';
+  try {
+    const r = await api('/api/drive/import/scan');
+    renderImport(r || {});
+  } catch (e) {
+    box.innerHTML = '<p class="sub">扫描失败：' + esc(e.message) + '</p>';
+  }
+}
+
+function renderImport({ orphans = [], ghosts = [] }){
+  const box = $('#importResult');
+
+  if (!orphans.length && !ghosts.length){
+    box.innerHTML = '<div class="empty"><span class="big">✨</span>网盘目录很干净：没有未登记的文件，也没有失效登记</div>';
+    return;
+  }
+
+  let html = '';
+  if (orphans.length){
+    html += '<p class="sub" style="margin-top:6px">发现 ' + orphans.length + ' 个未登记文件：</p>'
+      + orphans.map(o => {
+        const ok = o.isArchive && o.validMagic;
+        const badge = ok
+          ? '<span class="tag" style="color:#2e9e5b">压缩包校验通过</span>'
+          : '<span class="tag" style="color:#c0392b">不是有效 zip/rar，无法导入</span>';
+        return `
+        <div class="file" data-sn="${esc(o.storedName)}">
+          <div class="fi">${fileIcon(o.storedName)}</div>
+          <div class="fm">
+            <div class="fn" title="${esc(o.storedName)}">${esc(o.storedName)}</div>
+            <div class="meta">
+              <span>${fmtSize(o.size)}</span>
+              <span>${fmtTime(o.mtime)}</span>
+              ${badge}
+            </div>
+            ${ok ? `
+            <div class="meta" style="margin-top:6px">
+              <input class="input" data-role="name" style="flex:1;min-width:150px"
+                     value="${esc(o.suggestedName)}" placeholder="显示名（.zip/.rar）" maxlength="255">
+              <input class="input" data-role="pwd" style="flex:1;min-width:120px"
+                     placeholder="下载密码（4-128 位）" autocomplete="off">
+            </div>` : ''}
+          </div>
+          <div class="acts">
+            ${ok ? '<button class="btn sm primary" data-act="import">登记入库</button>' : ''}
+          </div>
+        </div>`;
+      }).join('');
+  }
+
+  if (ghosts.length){
+    html += '<p class="sub" style="margin-top:10px">⚠️ ' + ghosts.length + ' 个失效登记（磁盘上文件已丢失）：</p>'
+      + ghosts.map(g => `
+        <div class="file" data-id="${esc(g.id)}">
+          <div class="fi">💀</div>
+          <div class="fm">
+            <div class="fn">${esc(g.name)}</div>
+            <div class="meta"><span>磁盘缺文件 ${esc(g.storedName)}</span></div>
+          </div>
+          <div class="acts">
+            <button class="btn sm danger" data-act="ghost-del">清除登记</button>
+          </div>
+        </div>`).join('');
+  }
+
+  box.innerHTML = html;
+
+  // 登记入库
+  box.querySelectorAll('[data-act="import"]').forEach(btn => {
+    btn.onclick = async () => {
+      const row = btn.closest('.file');
+      const storedName = row.dataset.sn;
+      const name = row.querySelector('[data-role="name"]').value.trim();
+      const password = row.querySelector('[data-role="pwd"]').value;
+      if (password.length < 4 || password.length > 128) {
+        return toast('下载密码需 4-128 位', 'error');
+      }
+      btn.disabled = true; btn.textContent = '登记中…';
+      try {
+        const done = await api('/api/drive/import', {
+          method: 'POST',
+          body: JSON.stringify({ storedName, name, password })
+        });
+        toast('导入成功：' + done.name + '（' + fmtSize(done.size) + '）', 'ok');
+        loadFiles();
+        scanImport();
+      } catch (e) {
+        toast(e.message, 'error');
+        btn.disabled = false; btn.textContent = '登记入库';
+      }
+    };
+  });
+
+  // 清除幽灵登记（复用普通删除端点：磁盘文件本来就不存在，unlink 静默跳过）
+  box.querySelectorAll('[data-act="ghost-del"]').forEach(btn => {
+    btn.onclick = async () => {
+      const row = btn.closest('.file');
+      if (!confirm('确定清除这条失效登记吗？')) return;
+      try {
+        await api('/api/drive/files/' + encodeURIComponent(row.dataset.id), { method: 'DELETE' });
+        toast('已清除失效登记', 'ok');
+        loadFiles();
+        scanImport();
+      } catch (e) { toast(e.message, 'error'); }
+    };
+  });
+}
+
+$('#importScanBtn').onclick = scanImport;
 
 /* ---------------- 文件列表 ---------------- */
 async function loadFiles(){
