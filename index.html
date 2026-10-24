@@ -445,17 +445,28 @@ async function api(path, opts){
   const method = (opts.method || 'GET').toUpperCase();
   if (csrfToken && method !== 'GET' && method !== 'HEAD') headers['X-CSRF-Token'] = csrfToken;
 
-  let res;
-  try {
-    res = await fetch(API_BASE + path, Object.assign({}, opts, { headers, credentials: 'include' }));
-  } catch (e) {
-    throw new Error('无法连接服务器，请检查网络');
+  // 瞬态失败自动重试（网络错误 / 网关 5xx），退避 1s、2s；业务错误不重试直接抛
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, 1000 * attempt));
+    let res;
+    try {
+      res = await fetch(API_BASE + path, Object.assign({}, opts, { headers, credentials: 'include', cache: 'no-store' }));
+    } catch (e) {
+      lastErr = new Error('无法连接服务器，请检查网络');
+      continue;
+    }
+    if (res.status >= 500) {
+      lastErr = new Error('服务暂时不可用（' + res.status + '）');
+      continue;
+    }
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { error: text }; }
+    if (!res.ok) throw new Error((data && data.error) || ('请求失败（' + res.status + '）'));
+    return data;
   }
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { error: text }; }
-  if (!res.ok) throw new Error((data && data.error) || ('请求失败（' + res.status + '）'));
-  return data;
+  throw lastErr || new Error('无法连接服务器，请检查网络');
 }
 
 /* ---------------- 初始化 ---------------- */
@@ -641,18 +652,34 @@ function resetUploadUI(){
 }
 
 /* 单个分片：PUT raw body，服务器返回权威进度 */
+const CHUNK_STALL_MS = 20000;   // 20 秒没有任何字节进展视为链路停滞，主动放弃重试
 function uploadChunk(uploadId, offset, blob){
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     activeXhr = xhr;
+    let lastProg = Date.now();
+    let stalled = false, done = false;
+    const watch = setInterval(() => {
+      if (!done && Date.now() - lastProg > CHUNK_STALL_MS) {
+        stalled = true;
+        try { xhr.abort(); } catch (_) {}
+      }
+    }, 2000);
+    const finish = (fn) => {
+      if (done) return;
+      done = true;
+      clearInterval(watch);
+      fn();
+    };
     xhr.open('PUT', API_BASE + '/api/drive/up/chunk'
       + '?uploadId=' + encodeURIComponent(uploadId)
       + '&offset=' + offset);
     xhr.withCredentials = true;
-    xhr.timeout = 120000; // 单片超时，超时自动重试
+    xhr.timeout = 90000; // 兜底超时（停滞看门狗 20 秒会更早触发）
     if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.onload = () => {
+    if (xhr.upload) xhr.upload.onprogress = () => { lastProg = Date.now(); };
+    xhr.onload = () => finish(() => {
       let data = null;
       try { data = JSON.parse(xhr.responseText); } catch (_) {}
       if (xhr.status >= 200 && xhr.status < 300 && data
@@ -663,14 +690,21 @@ function uploadChunk(uploadId, offset, blob){
         err.status = xhr.status; err.data = data;
         reject(err);
       }
-    };
-    xhr.onerror = () => reject(new Error('网络错误'));
-    xhr.ontimeout = () => reject(new Error('分片超时'));
-    xhr.onabort = () => {
-      const err = new Error('已取消');
-      err.cancelled = true;
-      reject(err);
-    };
+    });
+    xhr.onerror = () => finish(() => {
+      const e = new Error('网络错误'); e.transient = true; reject(e);
+    });
+    xhr.ontimeout = () => finish(() => {
+      const e = new Error('分片超时'); e.transient = true; reject(e);
+    });
+    xhr.onabort = () => finish(() => {
+      if (stalled) {
+        const e = new Error('分片 ' + Math.round(CHUNK_STALL_MS / 1000) + ' 秒无进展，链路停滞');
+        e.transient = true; reject(e);
+      } else {
+        const e = new Error('已取消'); e.cancelled = true; reject(e);
+      }
+    });
     xhr.send(blob);
   });
 }
@@ -703,13 +737,15 @@ async function runUpload(job){
       if (job.offset > 0) toast('检测到历史进度，从 ' + fmtSize(job.offset) + ' 处续传', 'ok');
     }
 
-    // 2) 逐片上传，单片自动重试
+    // 2) 逐片上传，单片自动重试；弱网自动缩小分片（最低 1MB），链路顺畅后再逐步恢复
+    let chunkSize = CHUNK_SIZE;
+    let smooth = 0;                 // 连续成功计数
     while (job.offset < job.file.size) {
-      const end = Math.min(job.offset + CHUNK_SIZE, job.file.size);
-      const blob = job.file.slice(job.offset, end);
       let received = null, lastErr = null;
 
       for (let attempt = 0; attempt <= CHUNK_RETRIES; attempt++) {
+        const end = Math.min(job.offset + chunkSize, job.file.size);
+        const blob = job.file.slice(job.offset, end);
         try {
           received = await uploadChunk(job.uploadId, job.offset, blob);
           break;
@@ -733,16 +769,26 @@ async function runUpload(job){
             }
             throw e;
           }
+          // 网络类失败（断连/超时/停滞/网关 5xx）：立即缩小分片再试
+          if (e.transient || e.status >= 500) {
+            chunkSize = Math.max(1024 * 1024, chunkSize >> 1);
+            smooth = 0;
+          }
           if (attempt < CHUNK_RETRIES) {
             setProgress(Math.round(job.offset / job.file.size * 100),
-              '第 ' + (attempt + 1) + ' 次重试中…');
-            await new Promise(r => setTimeout(r, 600 * (attempt + 1)));
+              '第 ' + (attempt + 1) + ' 次重试中…（分片 ' + fmtSize(chunkSize) + '）');
+            await new Promise(r => setTimeout(r, Math.min(8000, 800 * Math.pow(2, attempt))));
           }
         }
       }
       if (received == null) throw (lastErr || new Error('分片上传失败'));
 
       job.offset = received;
+      smooth++;
+      if (smooth >= 4 && chunkSize < CHUNK_SIZE) {   // 连续 4 片顺利 → 分片逐级放大
+        chunkSize = Math.min(CHUNK_SIZE, chunkSize << 1);
+        smooth = 0;
+      }
       const pct = Math.round(job.offset / job.file.size * 100);
       setProgress(pct, pct + '% · ' + fmtSize(job.offset) + ' / '
         + fmtSize(job.file.size) + ' · 已传 '
