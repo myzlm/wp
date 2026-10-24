@@ -1078,6 +1078,12 @@ async function fetchChunk(url, start, end, signal){
       if (resp.status === 403 || resp.status === 404 || resp.status === 400) {
         throw new DlFatal((d && d.error) || ('HTTP ' + resp.status));
       }
+      if (resp.status === 429) {
+        // 限流不是分片大小问题：长退避等待，且不降档（降档只会让请求更频繁）
+        lastErr = new Error((d && d.error) || '请求太频繁');
+        await new Promise(r => setTimeout(r, 8000));
+        continue;
+      }
       lastErr = new Error((d && d.error) || ('HTTP ' + resp.status));
     } catch (e) {
       if (e.name === 'AbortError') throw e;
