@@ -314,7 +314,7 @@ body{transition:background-color .25s, color .25s}
     <div class="drop" id="drop">
       <span class="big">📁</span>
       <div class="t">点击选择文件，或将文件拖拽到此处</div>
-      <div class="h">任意格式 · 单文件 ≤ 10 GB</div>
+      <div class="h">仅 .zip / .rar 压缩包 · 单文件 ≤ 10 GB</div>
     </div>
     <input type="file" id="fileInput" class="hidden" accept=".zip,.rar">
 
@@ -445,7 +445,9 @@ async function api(path, opts){
   const method = (opts.method || 'GET').toUpperCase();
   if (csrfToken && method !== 'GET' && method !== 'HEAD') headers['X-CSRF-Token'] = csrfToken;
 
-  // 瞬态失败自动重试（网络错误 / 网关 5xx），退避 1s、2s；业务错误不重试直接抛
+  // 瞬态失败自动重试（网络错误 / 网关 5xx），退避 1s、2s；业务错误不重试直接抛。
+  // 仅幂等方法（GET/HEAD）默认重试——POST 重试可能在服务端重复执行（重复建会话、重复登记等）
+  const canRetry = method === 'GET' || method === 'HEAD' || opts.retryable === true;
   let lastErr = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt) await new Promise(r => setTimeout(r, 1000 * attempt));
@@ -454,10 +456,12 @@ async function api(path, opts){
       res = await fetch(API_BASE + path, Object.assign({}, opts, { headers, credentials: 'include', cache: 'no-store' }));
     } catch (e) {
       lastErr = new Error('无法连接服务器，请检查网络');
+      if (!canRetry) throw lastErr;
       continue;
     }
     if (res.status >= 500) {
       lastErr = new Error('服务暂时不可用（' + res.status + '）');
+      if (!canRetry) throw lastErr;
       continue;
     }
     const text = await res.text();
@@ -485,6 +489,8 @@ async function init(){
     toast(e.message, 'error');
     me = null;
   }
+  // 200 但内容异常（空对象/缺用户名）视作未登录，避免渲染出空的登录态 chip
+  if (me && !me.username) me = null;
 
   if (me && me.csrfToken) csrfToken = me.csrfToken;
   renderUser();
@@ -614,9 +620,10 @@ $('#clearPick').onclick = () => {
 const CHUNK_SIZE = 8 * 1024 * 1024;  // 8MB/片：弱网下单片重试代价小
 const CHUNK_RETRIES = 5;             // 单片最大自动重试次数
 
-let activeXhr = null;      // 进行中的分片请求（用于取消）
-let uploading = false;     // 上传中标记（防止误关页面）
-let uploadJob = null;      // { uploadId, file, offset, pwd, note, reinited }
+let activeXhr = null;        // 进行中的分片请求（用于取消）
+let uploading = false;       // 上传中标记（防止误关页面）
+let uploadJob = null;        // { uploadId, file, offset, pwd, note, reinited }
+let uploadCancelReq = false; // 取消请求标志：重试退避 sleep 期间 abort 无效，靠标志即时生效
 
 // 上传/下载中关闭或刷新页面给一次拦截提醒
 window.addEventListener('beforeunload', e => {
@@ -627,8 +634,18 @@ window.addEventListener('beforeunload', e => {
 });
 
 $('#cancelUpload').onclick = () => {
+  uploadCancelReq = true;
   if (activeXhr) activeXhr.abort();  // 触发 onabort → 清理会话
 };
+
+// 可中断的退避等待：取消请求能在等待期间即时生效
+async function cancellableSleep(ms){
+  const step = 200;
+  for (let waited = 0; waited < ms; waited += step) {
+    if (uploadCancelReq) { const e = new Error('已取消'); e.cancelled = true; throw e; }
+    await new Promise(r => setTimeout(r, Math.min(step, ms - waited)));
+  }
+}
 
 $('#retryUpload').onclick = () => {
   $('#retryUpload').classList.add('hidden');
@@ -645,6 +662,8 @@ function setProgress(pct, txt){
 function resetUploadUI(){
   uploading = false;
   activeXhr = null;
+  uploadCancelReq = false;
+  $('#clearPick').disabled = false;
   $('#cancelUpload').classList.add('hidden');
   $('#retryUpload').classList.add('hidden');
   $('#uploadBtn').disabled = false;
@@ -711,6 +730,8 @@ function uploadChunk(uploadId, offset, blob){
 
 async function runUpload(job){
   uploading = true;
+  uploadCancelReq = false;
+  $('#clearPick').disabled = true;   // 上传中禁用"移除"，避免 uploadJob 被断链导致会话无法清理
   $('#cancelUpload').classList.remove('hidden');
   $('#retryUpload').classList.add('hidden');
   $('#uploadBtn').disabled = true;
@@ -740,10 +761,13 @@ async function runUpload(job){
     // 2) 逐片上传，单片自动重试；弱网自动缩小分片（最低 1MB），链路顺畅后再逐步恢复
     let chunkSize = CHUNK_SIZE;
     let smooth = 0;                 // 连续成功计数
+    let chunksDone = 0;             // 实际成功片数（分片大小自适应，不能用固定 8MB 估算）
+    let stall409 = 0;               // 连续 409 且服务器进度无变化的计数（防死循环）
     while (job.offset < job.file.size) {
       let received = null, lastErr = null;
 
       for (let attempt = 0; attempt <= CHUNK_RETRIES; attempt++) {
+        if (attempt) await cancellableSleep(Math.min(8000, 800 * Math.pow(2, attempt - 1)));
         const end = Math.min(job.offset + chunkSize, job.file.size);
         const blob = job.file.slice(job.offset, end);
         try {
@@ -754,6 +778,12 @@ async function runUpload(job){
           lastErr = e;
           // 偏移不连续：以服务器权威进度校正后续传
           if (e.status === 409 && e.data && typeof e.data.received === 'number') {
+            // 服务器进度恰好等于本地偏移时校正无意义，会无限重传同一片——超过 3 次放弃
+            if (e.data.received === job.offset) {
+              if (++stall409 >= 3) throw new Error('服务器进度无变化，请稍后点"继续上传"重试');
+            } else {
+              stall409 = 0;
+            }
             received = e.data.received;
             break;
           }
@@ -777,13 +807,13 @@ async function runUpload(job){
           if (attempt < CHUNK_RETRIES) {
             setProgress(Math.round(job.offset / job.file.size * 100),
               '第 ' + (attempt + 1) + ' 次重试中…（分片 ' + fmtSize(chunkSize) + '）');
-            await new Promise(r => setTimeout(r, Math.min(8000, 800 * Math.pow(2, attempt))));
           }
         }
       }
       if (received == null) throw (lastErr || new Error('分片上传失败'));
 
       job.offset = received;
+      chunksDone++;
       smooth++;
       if (smooth >= 4 && chunkSize < CHUNK_SIZE) {   // 连续 4 片顺利 → 分片逐级放大
         chunkSize = Math.min(CHUNK_SIZE, chunkSize << 1);
@@ -791,8 +821,7 @@ async function runUpload(job){
       }
       const pct = Math.round(job.offset / job.file.size * 100);
       setProgress(pct, pct + '% · ' + fmtSize(job.offset) + ' / '
-        + fmtSize(job.file.size) + ' · 已传 '
-        + Math.ceil(job.offset / CHUNK_SIZE) + ' 片');
+        + fmtSize(job.file.size) + ' · 已传 ' + chunksDone + ' 片');
     }
 
     // 3) 完成校验转正
@@ -967,7 +996,8 @@ $('#importScanBtn').onclick = scanImport;
 /* ---------------- 文件列表 ---------------- */
 async function loadFiles(){
   try {
-    myFiles = await api('/api/drive/files');
+    const data = await api('/api/drive/files');
+    myFiles = Array.isArray(data) ? data : [];
     renderFiles();
   } catch (e) {
     $('#filesSub').textContent = '加载失败：' + e.message;
@@ -1143,6 +1173,7 @@ async function fetchChunk(url, start, end, signal){
 
 async function runDownload(){
   dl.busy = true;
+  dl.userStopped = false;   // 区分用户取消与网络故障（响应体读取阶段依赖此标志）
   $('#dlResume').classList.add('hidden');
   $('#dlCancel').classList.remove('hidden');
   $('#dlBar').classList.remove('hidden');
@@ -1185,21 +1216,20 @@ async function runDownload(){
       try {
         const resp = await fetchChunk(url, start, end, ctrl.signal);
         const bodyP = resp.arrayBuffer();
-        bodyP.catch(() => {});  // 竞态败者的拒绝不落成 unhandled rejection
         let buf;
-        const timer = setTimeout(() => {
+        const bodyTimer = setTimeout(() => {
           try { ctrl.abort(); } catch (_) {}  // 看门狗到点：掐断挂死的连接
         }, DL_BODY_TIMEOUT);
         try {
-          buf = await Promise.race([
-            bodyP,
-            new Promise((_, rej) => setTimeout(() => rej(new Error('BODY_TIMEOUT')), DL_BODY_TIMEOUT))
-          ]);
+          buf = await bodyP;
         } catch (e) {
-          if (e.message === 'BODY_TIMEOUT') throw new Error('分片响应超时');  // 转为可重试错误
-          throw e;
+          // 响应体读取失败：看门狗超时掐断，或连接中断。
+          // 必须确保连接被释放；若非用户主动停止，转为可重试错误（原实现会误判成"用户取消"终止整个下载）
+          try { ctrl.abort(); } catch (_) {}
+          if (dl.userStopped) { const ae = new Error('已取消'); ae.name = 'AbortError'; throw ae; }
+          throw new Error('分片响应超时或中断');
         } finally {
-          clearTimeout(timer);
+          clearTimeout(bodyTimer);
         }
         if (buf.byteLength !== end - start + 1) {
           // 响应体被掐断（隧道劣化特征）：立刻降档，下次用更小的片试
@@ -1308,7 +1338,7 @@ async function doFetch(){
       const writable = await handle.createWritable();
       dl = {
         id, name: data.name, size: data.size, ticket: data.ticket,
-        received: 0, handle, writable, busy: false, ctrls: null
+        received: 0, handle, writable, busy: false, ctrls: null, userStopped: false
       };
       $('#fetchPwd').value = '';
       toast('开始下载：' + data.name + '（' + fmtSize(data.size) + '）', 'ok');
@@ -1342,6 +1372,7 @@ $('#dlResume').onclick = async () => {
 };
 
 $('#dlCancel').onclick = () => {
+  if (dl) dl.userStopped = true;   // 标记主动取消，响应体阶段的 abort 才不会误判为网络故障
   if (dl && dl.ctrls) for (const c of dl.ctrls) { try { c.abort(); } catch (_) {} }
 };
 
